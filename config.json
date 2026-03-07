@@ -1,0 +1,56 @@
+{
+  "topics": [],
+  "newsapi_key": "",
+  "max_articles_per_topic": 10,
+  "schedule": {
+    "time": "07:00",
+    "enabled": true
+  },
+  "email": {
+    "enabled": false,
+    "to": "",
+    "from": "",
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": ""
+  },
+  "request_timeout_seconds": 10,
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "rss_feeds": [
+    {
+      "name": "India - Top News",
+      "url": "https://indianexpress.com/section/india/feed/"
+    },
+    {
+      "name": "India - Lifestyle",
+      "url": "https://indianexpress.com/section/lifestyle/feed/"
+    },
+    {
+      "name": "Delhi - Top News",
+      "url": "https://indianexpress.com/section/cities/delhi/feed/",
+      "max_articles": 5
+    },
+    {
+      "name": "Ars Technica",
+      "url": "https://feeds.arstechnica.com/arstechnica/index"
+    },
+    {
+      "name": "Wired",
+      "url": "https://www.wired.com/feed/rss",
+      "max_articles": 5
+    },
+    {
+      "name": "Hacker News",
+      "url": "https://hnrss.org/frontpage"
+    },
+    {
+      "name": "BBC News",
+      "url": "https://feeds.bbci.co.uk/news/rss.xml"
+    },
+    {
+      "name": "Reuters",
+      "url": "https://feeds.reuters.com/reuters/topNews"
+    }
+  ]
+}
