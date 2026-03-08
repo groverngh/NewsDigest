@@ -32,6 +32,11 @@
       "max_articles": 5
     },
     {
+      "name": "National (U.S.) News",
+      "url": "https://feeds.npr.org/1001/rss.xml",
+      "max_articles": 5
+    },
+    {
       "name": "Ars Technica",
       "url": "https://feeds.arstechnica.com/arstechnica/index"
     },
