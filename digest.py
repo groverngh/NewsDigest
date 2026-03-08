@@ -13,11 +13,13 @@ Usage:
 """
 
 import argparse
+import copy
 import datetime
 import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse, urlencode, parse_qs, urlunparse
 
@@ -132,6 +134,7 @@ body {
 }
 .refresh-btn:hover { background: #0060df; }
 .refresh-btn:disabled { background: #aeaeb2; cursor: default; }
+.excerpt-loading { color: #8e8e93; font-style: italic; font-size: 14px; }
 .settings-inline {
     display: flex;
     align-items: center;
@@ -251,7 +254,7 @@ body {
     line-height: 1.7;
 }
 .detail-empty-icon { font-size: 48px; margin-bottom: 16px; }
-.detail-content { display: none; flex-direction: column; flex: 1; padding: 32px 32px 0; max-width: 100%; overflow: hidden; }
+.detail-content { display: none; flex-direction: column; flex-shrink: 0; padding: 32px 32px 0; max-width: 100%; }
 .detail-content.visible { display: flex; }
 .detail-nav {
     display: flex;
@@ -304,47 +307,65 @@ body {
     color: #8e8e93;
     margin-bottom: 20px;
 }
-.detail-iframe-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
+.detail-excerpt-wrap {
+    background: #fff;
     border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 1px 6px rgba(0,0,0,.1);
-    margin-bottom: 0;
+    box-shadow: 0 1px 6px rgba(0,0,0,.08);
+    padding: 24px 28px;
+    margin-bottom: 20px;
+    flex-shrink: 0;
 }
-.detail-iframe {
-    flex: 1;
-    border: none;
-    width: 100%;
-    height: 100%;
-    background: #fff;
-}
-.iframe-blocked {
-    display: none;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    flex: 1;
-    padding: 32px;
-    text-align: center;
-    color: #8e8e93;
-    font-size: 14px;
+.detail-excerpt-wrap p {
+    font-size: 15px;
     line-height: 1.7;
-    background: #fff;
+    color: #3a3a3c;
+    margin-bottom: 14px;
+}
+.detail-excerpt-wrap p:last-child { margin-bottom: 0; }
+.detail-excerpt-wrap h2, .detail-excerpt-wrap h3, .detail-excerpt-wrap h4 {
+    font-size: 16px;
+    font-weight: 600;
+    color: #1c1c1e;
+    margin: 18px 0 8px;
+    line-height: 1.4;
+}
+.detail-excerpt-wrap ul, .detail-excerpt-wrap ol {
+    margin: 6px 0 14px 20px;
+    font-size: 15px;
+    line-height: 1.6;
+    color: #3a3a3c;
+}
+.detail-excerpt-wrap li { margin-bottom: 5px; }
+.detail-excerpt-wrap blockquote {
+    border-left: 3px solid #007aff;
+    padding: 4px 0 4px 14px;
+    color: #636366;
+    font-style: italic;
+    margin: 12px 0;
+    font-size: 15px;
+    line-height: 1.6;
+}
+.detail-excerpt-wrap a { color: #007aff; text-decoration: none; }
+.detail-excerpt-wrap a:hover { text-decoration: underline; }
+.detail-excerpt-wrap strong, .detail-excerpt-wrap b { color: #1c1c1e; font-weight: 600; }
+.detail-excerpt-empty {
+    font-size: 14px;
+    color: #aeaeb2;
+    font-style: italic;
 }
 .read-btn {
     display: inline-block;
-    margin-top: 16px;
-    padding: 10px 24px;
+    padding: 11px 28px;
     background: #007aff;
     color: #fff;
     text-decoration: none;
-    border-radius: 18px;
-    font-size: 14px;
+    border-radius: 20px;
+    font-size: 15px;
     font-weight: 500;
     transition: background .15s;
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin-bottom: 32px;
 }
 .read-btn:hover { background: #0060df; }
 
@@ -378,50 +399,74 @@ body {
 
 _JS = """
 (function() {
-    // Article data embedded by Python
-    var ARTICLES = window.__ARTICLES__ || [];
+    var ARTICLES   = [];
     var currentIdx = -1;
 
-    var sidebar    = document.getElementById('sidebar');
-    var detailPane = document.getElementById('detail-pane');
+    var sidebar       = document.getElementById('sidebar');
+    var detailPane    = document.getElementById('detail-pane');
     var detailContent = document.getElementById('detail-content');
     var detailEmpty   = document.getElementById('detail-empty');
 
     var detailFeed    = document.getElementById('detail-feed');
     var detailTitle   = document.getElementById('detail-title');
     var detailMeta    = document.getElementById('detail-meta');
-    var detailIframe  = document.getElementById('detail-iframe');
-    var iframeBlocked = document.getElementById('iframe-blocked');
+    var detailExcerpt = document.getElementById('detail-excerpt');
     var detailLink    = document.getElementById('detail-link');
     var navCounter    = document.getElementById('nav-counter');
     var prevBtn       = document.getElementById('prev-btn');
     var nextBtn       = document.getElementById('next-btn');
     var backBtn       = document.getElementById('back-btn');
+    var refreshBtn    = document.getElementById('refresh-btn');
 
     function isMobile() { return window.innerWidth <= 640; }
+
+    function escHtml(s) {
+        return String(s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function setExcerpt(html) {
+        if (!html) {
+            detailExcerpt.innerHTML = '<p class="detail-excerpt-empty">No preview available.</p>';
+            return;
+        }
+        // html is already sanitized server-side — render directly
+        detailExcerpt.innerHTML = html;
+    }
 
     function showArticle(idx) {
         if (idx < 0 || idx >= ARTICLES.length) return;
         currentIdx = idx;
         var a = ARTICLES[idx];
 
-        // Highlight active row
         document.querySelectorAll('.article-row').forEach(function(r) { r.classList.remove('active'); });
         var row = document.querySelector('.article-row[data-idx="' + idx + '"]');
-        if (row) {
-            row.classList.add('active');
-            row.scrollIntoView({block: 'nearest'});
-        }
+        if (row) { row.classList.add('active'); row.scrollIntoView({block: 'nearest'}); }
 
         detailFeed.textContent  = a.feed || '';
         detailTitle.textContent = a.title || '';
         detailMeta.textContent  = [a.source, a.published].filter(Boolean).join(' \u00b7 ');
         detailLink.href         = a.url || '#';
 
-        // Load article directly in iframe
-        detailIframe.style.display  = 'block';
-        iframeBlocked.style.display = 'none';
-        detailIframe.src = a.url || 'about:blank';
+        if (!a.excerpt) {
+            // No RSS preview — fetch and extract from article URL on demand
+            detailExcerpt.innerHTML = '<p class="excerpt-loading">Extracting article\u2026</p>';
+            var fetchIdx = idx;
+            fetch('/api/extract?url=' + encodeURIComponent(a.url))
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (currentIdx !== fetchIdx) return;
+                    if (d.text) { a.excerpt = d.text; }  // cache for this session
+                    setExcerpt(d.text || '');
+                })
+                .catch(function() {
+                    if (currentIdx !== fetchIdx) return;
+                    detailExcerpt.innerHTML = '<p class="detail-excerpt-empty">Failed to load article.</p>';
+                });
+        } else {
+            setExcerpt(a.excerpt);
+        }
 
         navCounter.textContent = (idx + 1) + ' / ' + ARTICLES.length;
         prevBtn.disabled = (idx === 0);
@@ -441,108 +486,113 @@ _JS = """
         detailPane.classList.remove('visible');
     }
 
-    // Detect blocked iframes:
-    // - Cross-origin load SUCCESS → contentDocument throws SecurityError (can't access cross-origin)
-    // - X-Frame-Options BLOCKED → browser renders its own error page (same-origin) → contentDocument accessible
-    if (detailIframe) {
-        detailIframe.addEventListener('load', function() {
-            if (!detailIframe.src || detailIframe.src === 'about:blank') return;
-            try {
-                var dummy = detailIframe.contentDocument.body;
-                // No error = same-origin error/blocked page → show fallback
-                detailIframe.style.display  = 'none';
-                iframeBlocked.style.display = 'flex';
-            } catch(e) {
-                if (e.name === 'SecurityError') {
-                    // Successfully loaded cross-origin → keep iframe visible
-                } else {
-                    detailIframe.style.display  = 'none';
-                    iframeBlocked.style.display = 'flex';
-                }
-            }
-        });
-    }
-
-    // ── Collapse/expand feed groups ─────────────────────────────────────────
-    document.querySelectorAll('.feed-name').forEach(function(nameEl) {
+    function bindFeedCollapse(nameEl) {
         nameEl.addEventListener('click', function() {
             nameEl.closest('.feed-group').classList.toggle('collapsed');
         });
-    });
+    }
 
-    // ── Per-feed max_articles save ───────────────────────────────────────────
-    document.querySelectorAll('.feed-max-save').forEach(function(btn) {
-        btn.addEventListener('click', function() {
-            var feedName = btn.dataset.feed;
-            var input = document.querySelector('.feed-max-input[data-feed="' + feedName + '"]');
-            var val = parseInt(input.value, 10);
-            if (!val || val < 1) return;
-            var payload = {feed_max_articles: {}};
-            payload.feed_max_articles[feedName] = val;
-            fetch('/api/config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(function(r) { return r.json(); }).then(function() {
-                var orig = btn.textContent;
-                btn.style.background = '#007aff';
-                setTimeout(function() { btn.style.background = ''; }, 1200);
+    function bindArticleRows(container) {
+        container.querySelectorAll('.article-row').forEach(function(row) {
+            row.addEventListener('click', function() {
+                showArticle(parseInt(row.dataset.idx, 10));
             });
         });
-    });
+    }
 
-    // Article row clicks
-    document.querySelectorAll('.article-row').forEach(function(row) {
-        row.addEventListener('click', function() {
-            showArticle(parseInt(row.dataset.idx, 10));
+    function renderLiveSidebar(articles) {
+        var feedList = document.querySelector('.feed-list');
+        var groups = {}, order = [];
+        articles.forEach(function(a, idx) {
+            if (!groups[a.feed]) { groups[a.feed] = []; order.push(a.feed); }
+            groups[a.feed].push({idx: idx, a: a});
         });
-    });
+
+        if (order.length === 0) {
+            feedList.innerHTML = '<div class="empty-list"><p>No articles found.</p></div>';
+            return;
+        }
+
+        var html = '';
+        order.forEach(function(feedName) {
+            var items = groups[feedName];
+            html += '<div class="feed-group collapsed">'
+                  + '<div class="feed-name">'
+                  + '<span class="feed-toggle">&#9654;</span>'
+                  + '<span class="feed-label">' + escHtml(feedName) + '</span>'
+                  + '<span class="feed-count">' + items.length + '</span>'
+                  + '</div>';
+            items.forEach(function(item) {
+                var meta = [item.a.source, item.a.published].filter(Boolean).join(' \u00b7 ');
+                html += '<div class="article-row" data-idx="' + item.idx + '">'
+                      + '<div class="article-row-title">' + escHtml(item.a.title) + '</div>'
+                      + '<div class="article-row-meta">' + escHtml(meta) + '</div>'
+                      + '</div>';
+            });
+            html += '</div>';
+        });
+
+        feedList.innerHTML = html;
+        feedList.querySelectorAll('.feed-name').forEach(bindFeedCollapse);
+        bindArticleRows(feedList);
+    }
 
     if (prevBtn) prevBtn.addEventListener('click', function() { showArticle(currentIdx - 1); });
     if (nextBtn) nextBtn.addEventListener('click', function() { showArticle(currentIdx + 1); });
     if (backBtn) backBtn.addEventListener('click', showSidebar);
 
-    // Keyboard navigation
     document.addEventListener('keydown', function(e) {
         if (e.key === 'ArrowDown' || e.key === 'j') showArticle(currentIdx + 1);
         if (e.key === 'ArrowUp'   || e.key === 'k') showArticle(currentIdx - 1);
         if (e.key === 'Escape') showSidebar();
     });
 
-    // ── Refresh button ──────────────────────────────────────────────────────
-    var refreshBtn = document.getElementById('refresh-btn');
-    if (refreshBtn) {
-        refreshBtn.addEventListener('click', function() {
-            refreshBtn.disabled = true;
-            refreshBtn.textContent = 'Fetching\u2026';
-            fetch('/api/run', {method: 'POST'})
-                .then(function() { pollStatus(); })
-                .catch(function() {
-                    refreshBtn.disabled = false;
-                    refreshBtn.textContent = '\u21bb Refresh';
-                });
-        });
-    }
-    function pollStatus() {
-        fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) {
-            if (d.running) setTimeout(pollStatus, 2000);
-            else window.location.reload();
-        });
+    // ── Load feeds ───────────────────────────────────────────────────────────
+    function loadFeeds(forceRefresh) {
+        var feedList = document.querySelector('.feed-list');
+        var url = forceRefresh ? '/api/feeds?refresh=true' : '/api/feeds';
+
+        if (forceRefresh) {
+            // Keep old articles visible while refreshing in background
+            if (refreshBtn) { refreshBtn.disabled = true; refreshBtn.textContent = 'Refreshing\u2026'; }
+        } else {
+            feedList.innerHTML = '<div class="empty-list"><p>Loading feeds\u2026</p></div>';
+            currentIdx = -1;
+            detailEmpty.style.display   = '';
+            detailContent.style.display = 'none';
+        }
+
+        fetch(url)
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                ARTICLES = d.articles || [];
+                renderLiveSidebar(ARTICLES);
+                if (forceRefresh) {
+                    currentIdx = -1;
+                    detailEmpty.style.display   = '';
+                    detailContent.style.display = 'none';
+                }
+                if (refreshBtn) { refreshBtn.disabled = false; refreshBtn.textContent = '\u21bb Refresh'; }
+            })
+            .catch(function() {
+                if (!forceRefresh) {
+                    feedList.innerHTML = '<div class="empty-list"><p>Failed to load feeds. Check server.</p></div>';
+                }
+                if (refreshBtn) { refreshBtn.disabled = false; refreshBtn.textContent = '\u21bb Refresh'; }
+            });
     }
 
-    // ── Settings ────────────────────────────────────────────────────────────
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', function() { loadFeeds(true); });
+    }
+
+    // ── Settings ─────────────────────────────────────────────────────────────
     var saveBtn  = document.getElementById('save-settings');
     var savedMsg = document.getElementById('saved-msg');
     var maxInput = document.getElementById('max-articles');
 
     fetch('/api/config').then(function(r) { return r.json(); }).then(function(d) {
         if (maxInput) maxInput.value = d.max_articles_per_topic;
-        if (d.feeds) {
-            d.feeds.forEach(function(f) {
-                var inp = document.querySelector('.feed-max-input[data-feed="' + f.name + '"]');
-                if (inp) inp.value = f.max_articles;
-            });
-        }
     });
 
     if (saveBtn) {
@@ -558,6 +608,9 @@ _JS = """
             });
         });
     }
+
+    // ── Auto-load on start (uses cache if available) ─────────────────────────
+    loadFeeds(false);
 })();
 """
 
@@ -662,6 +715,20 @@ def mark_seen(url: str, title: str, topic: str, history: dict) -> None:
 
 # ── RSS feed fetcher ───────────────────────────────────────────────────────────
 
+def _resolve_google_news_url(url: str, config: dict) -> str:
+    """Follow a news.google.com redirect URL to get the real article URL."""
+    try:
+        resp = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=min(config.get("request_timeout_seconds", 10), 6),
+            headers={"User-Agent": config.get("user_agent", "Mozilla/5.0")},
+        )
+        return resp.url or url
+    except Exception:
+        return url
+
+
 def _fetch_one_feed(feed_cfg: dict, config: dict) -> list:
     """Fetch a single RSS feed and return all valid entries as article dicts."""
     feed_url  = feed_cfg.get("url", "")
@@ -679,8 +746,13 @@ def _fetch_one_feed(feed_cfg: dict, config: dict) -> list:
     articles = []
     for entry in feed.entries:
         link = entry.get("link", "")
-        if not link or "google.com" in link:
+        if not link:
             continue
+        # Google News links redirect to the real article — resolve them
+        if "news.google.com" in link:
+            link = _resolve_google_news_url(link, config)
+        elif "google.com" in link:
+            continue  # skip Google Search / other google.com links
         published = entry.get("published") or entry.get("updated") or ""
         articles.append({
             "title":       entry.get("title", "").strip(),
@@ -689,6 +761,11 @@ def _fetch_one_feed(feed_cfg: dict, config: dict) -> list:
             "published":   published,
             "fetched_via": "rss",
             "_summary":    BeautifulSoup(entry.get("summary", ""), "lxml").get_text(),
+            # Full content from content:encoded if the feed provides it
+            "_content_html": (
+                (getattr(entry, "content", None) or [{}])[0].get("value", "")
+                or entry.get("summary", "")
+            ),
         })
     return articles
 
@@ -747,6 +824,58 @@ def fetch_all_feeds(config: dict, history: dict) -> list[dict]:
         logging.info("  %s: %d new articles", feed_name, len(articles))
 
     return [{"topic": name, "articles": arts} for name, arts in by_feed.items()]
+
+
+def fetch_all_feeds_live(config: dict) -> list[dict]:
+    """
+    Fetch all configured RSS feeds in parallel — no history filter.
+    Returns a flat list of article dicts in feed-config order.
+    """
+    feeds        = config.get("rss_feeds", DEFAULT_RSS_FEEDS)
+    global_max_n = config.get("max_articles_per_topic", 5)
+
+    def _fetch_feed(feed_cfg: dict) -> tuple[str, list]:
+        max_n     = feed_cfg.get("max_articles", global_max_n)
+        feed_name = feed_cfg.get("name", feed_cfg.get("url", ""))
+        articles  = []
+        for a in _fetch_one_feed(feed_cfg, config):
+            rss_preview = html_to_excerpt(a.get("_content_html", ""), max_chars=2000)
+            articles.append({
+                "feed":      feed_name,
+                "title":     a["title"],
+                "url":       a["url"],
+                "source":    a["source"],
+                "published": _fmt_date(a.get("published", "")),
+                "excerpt":   rss_preview,
+            })
+            if len(articles) >= max_n:
+                break
+        return feed_name, articles
+
+    # Fetch all feeds concurrently (up to 8 at a time)
+    by_feed: dict[str, list] = {}
+    with ThreadPoolExecutor(max_workers=min(len(feeds), 8)) as pool:
+        futures = {pool.submit(_fetch_feed, fc): fc for fc in feeds}
+        for future in as_completed(futures):
+            try:
+                feed_name, articles = future.result()
+                by_feed[feed_name] = articles
+            except Exception as e:
+                logging.debug("Feed fetch error: %s", e)
+
+    # Assemble in original config order, deduplicate URLs
+    result: list[dict] = []
+    seen_urls: set = set()
+    for feed_cfg in feeds:
+        feed_name = feed_cfg.get("name", feed_cfg.get("url", ""))
+        for a in by_feed.get(feed_name, []):
+            c = canonical_url(a["url"])
+            if c not in seen_urls:
+                seen_urls.add(c)
+                result.append(a)
+
+    logging.info("Live fetch: %d articles from %d feeds", len(result), len(feeds))
+    return result
 
 
 # ── NewsAPI ────────────────────────────────────────────────────────────────────
@@ -822,44 +951,175 @@ def fetch_articles_for_topic(topic: str, config: dict, history: dict) -> list:
 
 # ── Excerpt extraction ─────────────────────────────────────────────────────────
 
-def extract_excerpt(url: str, config: dict) -> str:
+_SAFE_INLINE = frozenset({"strong", "em", "b", "i", "a", "code", "mark", "br"})
+
+
+def _clean_inline_html(tag) -> str:
+    """Return safe inner HTML for a tag, keeping only inline formatting tags."""
+    t = copy.deepcopy(tag)
+    for child in t.find_all(True):
+        if child.name in _SAFE_INLINE:
+            if child.name == "a":
+                href = child.get("href", "")
+                child.attrs = {}
+                if href and href.startswith(("http://", "https://")):
+                    child["href"] = href
+                    child["target"] = "_blank"
+                    child["rel"] = "noopener noreferrer"
+            else:
+                child.attrs = {}
+        else:
+            child.unwrap()
+    return t.decode_contents()
+
+
+def _score_container(el) -> int:
+    """Score how likely an element is the main article body (higher = better)."""
+    paras = [p for p in el.find_all("p") if len(p.get_text(strip=True)) >= 50]
+    if not paras:
+        return 0
+    para_text   = sum(len(p.get_text(strip=True)) for p in paras)
+    total_text  = max(len(el.get_text(strip=True)), 1)
+    link_text   = sum(len(a.get_text(strip=True)) for a in el.find_all("a"))
+    link_ratio  = link_text / total_text
+    return int(para_text * max(0, 1 - link_ratio * 2))
+
+
+def _soup_to_html(soup_el, max_chars: int) -> str:
     """
-    Fetch first 50KB of article HTML and extract the best available excerpt.
+    Walk a BeautifulSoup container and return clean article HTML.
+    Preserves paragraphs, headings, lists, blockquotes; strips everything else.
+    """
+    parts  = []
+    total  = 0
+    seen   = set()
+
+    for elem in soup_el.find_all(["p", "h1", "h2", "h3", "h4", "blockquote", "ul", "ol"]):
+        eid = id(elem)
+        if eid in seen:
+            continue
+        seen.add(eid)
+
+        text = elem.get_text(" ", strip=True)
+
+        if elem.name == "p":
+            if len(text) < 40:
+                continue
+            html = f"<p>{_clean_inline_html(elem)}</p>"
+
+        elif elem.name in ("h1", "h2", "h3", "h4"):
+            if not text:
+                continue
+            html = f"<h3>{esc(text)}</h3>"
+
+        elif elem.name == "blockquote":
+            if not text:
+                continue
+            html = f"<blockquote>{esc(text)}</blockquote>"
+
+        elif elem.name in ("ul", "ol"):
+            items = [
+                f"<li>{esc(li.get_text(' ', strip=True))}</li>"
+                for li in elem.find_all("li")
+                if li.get_text(strip=True)
+            ]
+            if not items:
+                continue
+            tag = elem.name
+            html = f"<{tag}>{''.join(items)}</{tag}>"
+
+        else:
+            continue
+
+        parts.append(html)
+        total += len(html)
+        if total >= max_chars:
+            break
+
+    return "\n".join(parts)
+
+
+def html_to_excerpt(raw_html: str, max_chars: int = 2000) -> str:
+    """Extract clean article HTML from an arbitrary HTML string (e.g. RSS content)."""
+    if not raw_html:
+        return ""
+    soup = BeautifulSoup(raw_html, "lxml")
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside",
+                     "form", "noscript", "iframe", "button", "figure"]):
+        tag.decompose()
+    result = _soup_to_html(soup, max_chars)
+    return result
+
+
+def extract_excerpt(url: str, config: dict, max_chars: int = 2000) -> str:
+    """
+    Fetch an article URL and return clean, sanitized HTML with formatting preserved.
+    Uses a scoring approach to find the main content container.
     Returns "" on any failure — never raises.
     """
     timeout = config.get("request_timeout_seconds", 10)
     ua = config.get("user_agent", "Mozilla/5.0")
     try:
-        resp = requests.get(
-            url,
-            timeout=timeout,
-            headers={"User-Agent": ua},
-            stream=True,
-        )
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": ua}, stream=True)
         resp.raise_for_status()
 
         chunk = b""
-        for data in resp.iter_content(chunk_size=4096):
+        for data in resp.iter_content(chunk_size=8192):
             chunk += data
-            if len(chunk) >= 50_000:
+            if len(chunk) >= 200_000:
                 break
         resp.close()
 
         soup = BeautifulSoup(chunk, "lxml")
 
-        candidates = [
+        # Strip noise elements
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside",
+                         "form", "noscript", "iframe", "button", "input", "select",
+                         "figure", "figcaption", "svg", "canvas", "video", "audio"]):
+            tag.decompose()
+
+        # 1. Try named semantic containers first
+        _CONTENT_ID  = re.compile(r'\b(article|content|story|main|post|body)\b', re.I)
+        _CONTENT_CLS = re.compile(
+            r'\b(article[_-]body|article[_-]content|post[_-]body|story[_-]body'
+            r'|entry[_-]content|content[_-]body|article__body|story__body'
+            r'|article__content|post__content|td-post-content)\b', re.I
+        )
+        named = [
+            soup.find("article"),
+            soup.find(id=_CONTENT_ID),
+            soup.find(class_=_CONTENT_CLS),
+            soup.find("main"),
+        ]
+        best       = None
+        best_score = 0
+        for cand in named:
+            if cand:
+                s = _score_container(cand)
+                if s > best_score:
+                    best_score, best = s, cand
+
+        # 2. If no good semantic match, score all divs/sections
+        if best_score < 300:
+            for div in soup.find_all(["div", "section"]):
+                s = _score_container(div)
+                if s > best_score:
+                    best_score, best = s, div
+
+        container = best or soup.body
+        if container:
+            result = _soup_to_html(container, max_chars)
+            if result:
+                return result
+
+        # 3. Last resort: meta description
+        for meta_tag in [
             soup.find("meta", property="og:description"),
             soup.find("meta", attrs={"name": "description"}),
             soup.find("meta", attrs={"name": "twitter:description"}),
-        ]
-        for tag in candidates:
-            if tag and tag.get("content", "").strip():
-                return tag["content"].strip()[:300]
-
-        for p in soup.find_all("p"):
-            text = p.get_text(strip=True)
-            if len(text) >= 80:
-                return text[:300]
+        ]:
+            if meta_tag and meta_tag.get("content", "").strip():
+                return f"<p>{esc(meta_tag['content'].strip())}</p>"
 
     except Exception as e:
         logging.debug("excerpt failed for %s: %s", url, e)
@@ -1004,13 +1264,8 @@ def build_html_report(digest: dict) -> str:
       <div class="detail-feed" id="detail-feed"></div>
       <h2 class="detail-title" id="detail-title"></h2>
       <div class="detail-meta" id="detail-meta"></div>
-      <div class="detail-iframe-wrap">
-        <iframe class="detail-iframe" id="detail-iframe" src="about:blank"></iframe>
-        <div class="iframe-blocked" id="iframe-blocked">
-          <p>This site does not allow embedding.</p>
-          <a class="read-btn" id="detail-link" href="#" target="newsreader">Open Article &#8594;</a>
-        </div>
-      </div>
+      <div class="detail-excerpt-wrap" id="detail-excerpt"></div>
+      <a class="read-btn" id="detail-link" href="#" target="newsreader">Read Full Article &#8594;</a>
     </div>
   </main>
 

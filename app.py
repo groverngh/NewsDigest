@@ -28,6 +28,8 @@ from digest import (
     LATEST_PATH,
     build_digest,
     build_html_report,
+    extract_excerpt,
+    fetch_all_feeds_live,
     load_config,
 )
 
@@ -38,9 +40,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-_CONFIG   = load_config()
-_run_lock = threading.Lock()
-_running  = False   # visible to /api/status
+_CONFIG      = load_config()
+_run_lock    = threading.Lock()
+_running     = False   # visible to /api/status
+_feeds_cache: dict | None = None
+_feeds_lock  = threading.Lock()
 
 
 def _cors(response):
@@ -148,6 +152,35 @@ def api_config_post():
         logging.info("Config updated: %s", data)
 
     return _cors(jsonify({"status": "ok", "max_articles_per_topic": _CONFIG["max_articles_per_topic"]}))
+
+
+@app.route("/api/feeds")
+def api_feeds():
+    """Return cached feeds, or fetch fresh if cache is empty or ?refresh=true."""
+    global _feeds_cache
+    force = request.args.get("refresh", "").lower() in ("1", "true")
+
+    if not force and _feeds_cache is not None:
+        logging.info("Serving feeds from cache (%d articles)", len(_feeds_cache["articles"]))
+        return _cors(jsonify(_feeds_cache))
+
+    articles = fetch_all_feeds_live(_CONFIG)
+    payload  = {"articles": articles}
+    with _feeds_lock:
+        _feeds_cache = payload
+    return _cors(jsonify(payload))
+
+
+@app.route("/api/extract")
+def api_extract():
+    """Live mode: fetch and extract readable text from an article URL."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        resp = jsonify({"error": "url param required"})
+        resp.status_code = 400
+        return _cors(resp)
+    text = extract_excerpt(url, _CONFIG, max_chars=2000)
+    return _cors(jsonify({"url": url, "text": text}))
 
 
 @app.route("/api/run", methods=["POST"])

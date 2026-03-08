@@ -33,7 +33,7 @@
     },
     {
       "name": "National (U.S.) News",
-      "url": "https://feeds.npr.org/1001/rss.xml",
+      "url": "https://news.google.com/rss/search?q=site:reuters.com+when:24h&hl=en-US&gl=US&ceid=US:en",
       "max_articles": 5
     },
     {
